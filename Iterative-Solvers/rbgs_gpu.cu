@@ -3,159 +3,243 @@
 #include <ctime>
 #include <cuda_runtime.h>
 
-/* 
- * PROBLEM SETUP: 2D Lid-Driven Cavity (GPU Navier-Stokes)
- * 
- * Physics: Simulating incompressible water inside a sealed square box 
- *          where the top wall (lid) is constantly sliding to the right.
- * Domain:  1.0m x 1.0m cavity, 128 x 128 FDM grid.
- * Fluid:   Density (rho) = 1.0, Kinematic Viscosity (nu) = 0.01 (Re = 100).
- * B.C.s:   Top Lid: u = 1.0 m/s, v = 0.0 m/s. 
- *          Sides/Bottom: u = 0.0, v = 0.0. 
- * Algorithm: Fractional Step Method (Fully Parallelized on VRAM)
+/*
+SETUP: 2D Lid-Driven Cavity (GPU)
 */
 
-// KERNEL 0: Apply Moving Lid Boundary Condition
-__global__ void applyBoundaryKernel(double* u, int N) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j < N) {
-        u[0 * N + j] = 1.0; // Top lid slides right at 1 m/s
+#define IDX(i, j) ((i) * N_ext + (j))
+
+// Error check macro - wrap every CUDA call with this
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ \
+                  << " -> " << cudaGetErrorString(err) << std::endl; \
+        exit(1); \
+    } \
+} while (0)
+
+// GHOST NODE KERNELS
+__global__ void updateVelocityGhostsKernel(double* u, double* v, int N, int N_ext) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    if (k <= N) {
+        // TOP WALL (Row N+1: Moving Lid)
+        u[IDX(N + 1, k)] = 2.0 * 1.0 - u[IDX(N, k)];
+        v[IDX(N + 1, k)] = 2.0 * 0.0 - v[IDX(N, k)];
+
+        // BOTTOM WALL (Row 0)
+        u[IDX(0, k)] = -u[IDX(1, k)];
+        v[IDX(0, k)] = -v[IDX(1, k)];
+
+        // LEFT WALL (Col 0)
+        u[IDX(k, 0)] = -u[IDX(k, 1)];
+        v[IDX(k, 0)] = -v[IDX(k, 1)];
+
+        // RIGHT WALL (Col N+1)
+        u[IDX(k, N + 1)] = -u[IDX(k, N)];
+        v[IDX(k, N + 1)] = -v[IDX(k, N)];
     }
 }
 
-// KERNEL 1: Predictor Step (Solve Momentum)
-__global__ void predictorKernel(double* u, double* v, double* u_star, double* v_star, 
-                                int N, double h, double dt, double nu) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
+__global__ void pinPressureKernel(double* p, int N_ext) {
+    p[IDX(1, 1)] = 0.0;
+}
 
-    if (i > 0 && i < N - 1 && j > 0 && j < N - 1) {
-        int P = i * N + j;
-        
-        double du_dx = (u[i*N + (j+1)] - u[i*N + (j-1)]) / (2.0 * h);
-        double du_dy = (u[(i+1)*N + j] - u[(i-1)*N + j]) / (2.0 * h);
-        double dv_dx = (v[i*N + (j+1)] - v[i*N + (j-1)]) / (2.0 * h);
-        double dv_dy = (v[(i+1)*N + j] - v[(i-1)*N + j]) / (2.0 * h);
-        
-        double d2u = (u[(i+1)*N + j] + u[(i-1)*N + j] + u[i*N + (j+1)] + u[i*N + (j-1)] - 4.0*u[P]) / (h*h);
-        double d2v = (v[(i+1)*N + j] + v[(i-1)*N + j] + v[i*N + (j+1)] + v[i*N + (j-1)] - 4.0*v[P]) / (h*h);
+// PREDICTOR KERNEL
+__global__ void predictorKernel(double* u, double* v, double* u_star, double* v_star, int N, int N_ext, double h, double dt, double nu) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x + 1; // X-axis (Columns)
+    int i = blockIdx.y * blockDim.y + threadIdx.y + 1; // Y-axis (Rows)
+
+    if (i <= N && j <= N) {
+        int P = IDX(i, j);
+        double A_E = 1.0 / (h * h); double A_W = 1.0 / (h * h);
+        double A_N = 1.0 / (h * h); double A_S = 1.0 / (h * h);
+        double A_P = -4.0 / (h * h);
+
+        double du_dx = (u[IDX(i, j+1)] - u[IDX(i, j-1)]) / (2.0 * h);
+        double du_dy = (u[IDX(i+1, j)] - u[IDX(i-1, j)]) / (2.0 * h);
+        double dv_dx = (v[IDX(i, j+1)] - v[IDX(i, j-1)]) / (2.0 * h);
+        double dv_dy = (v[IDX(i+1, j)] - v[IDX(i-1, j)]) / (2.0 * h);
+
+        double d2u = A_E*u[IDX(i, j+1)] + A_W*u[IDX(i, j-1)] + A_N*u[IDX(i+1, j)] + A_S*u[IDX(i-1, j)] + A_P*u[P];
+        double d2v = A_E*v[IDX(i, j+1)] + A_W*v[IDX(i, j-1)] + A_N*v[IDX(i+1, j)] + A_S*v[IDX(i-1, j)] + A_P*v[P];
 
         u_star[P] = u[P] - dt * (u[P]*du_dx + v[P]*du_dy) + dt * nu * d2u;
         v_star[P] = v[P] - dt * (u[P]*dv_dx + v[P]*dv_dy) + dt * nu * d2v;
     }
 }
 
-// KERNEL 2: Mass Error Calculation (Source Term)
-__global__ void divergenceKernel(double* u_star, double* v_star, double* S, 
-                                 int N, double h, double dt, double rho) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
+// DIVERGENCE KERNEL
+__global__ void divergenceKernel(double* u_star, double* v_star, double* S, int N, int N_ext, double h, double dt, double rho) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
 
-    if (i > 0 && i < N - 1 && j > 0 && j < N - 1) {
-        int P = i * N + j;
-        double du_star_dx = (u_star[i*N + (j+1)] - u_star[i*N + (j-1)]) / (2.0 * h);
-        double dv_star_dy = (v_star[(i+1)*N + j] - v_star[(i-1)*N + j]) / (2.0 * h);
-        
-        S[P] = (rho / dt) * (du_star_dx + dv_star_dy);
+    if (i <= N && j <= N) {
+        S[IDX(i, j)] = (rho / dt) * ((u_star[IDX(i, j+1)] - u_star[IDX(i, j-1)])/(2.0*h) +
+                                     (v_star[IDX(i+1, j)] - v_star[IDX(i-1, j)])/(2.0*h));
     }
 }
 
-// KERNEL 3: Pressure Poisson Solver (Red-Black)
-__global__ void poissonRbgsKernel(double* p, double* S, int N, double h, int color) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
+// POISSON SOLVER KERNEL
+__global__ void poissonRbgsKernelFused(double* p, double* S, int N, int N_ext, double h, int num_iterations) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
 
-    if (i > 0 && i < N - 1 && j > 0 && j < N - 1) {
-        if ((i + j) % 2 == color) {
-            int P = i * N + j;
-            p[P] = 0.25 * (p[(i-1)*N + j] + p[(i+1)*N + j] + p[i*N + (j+1)] + p[i*N + (j-1)] - (h*h * S[P]));
+    if (i <= N && j <= N) {
+        int P = IDX(i, j);
+        double A_E = 1.0 / (h * h); double A_W = 1.0 / (h * h);
+        double A_N = 1.0 / (h * h); double A_S = 1.0 / (h * h);
+        double A_P = -4.0 / (h * h);
+
+        for (int iter = 0; iter < num_iterations; iter++) {
+            // Update pressure ghosts 
+            if (i == 1) {
+                p[IDX(0, j)] = p[IDX(1, j)];      // Bottom
+            }
+            if (i == N) {
+                p[IDX(N + 1, j)] = p[IDX(N, j)];  // Top
+            }
+            if (j == 1) {
+                p[IDX(i, 0)] = p[IDX(i, 1)];      // Left
+            }
+            if (j == N) {
+                p[IDX(i, N + 1)] = p[IDX(i, N)];  // Right
+            }
+            __syncthreads();
+
+            // RED pass (color = 0)
+            if ((i + j) % 2 == 0) {
+                p[P] = (S[P] - (A_E*p[IDX(i, j+1)] + A_W*p[IDX(i, j-1)] + 
+                                A_N*p[IDX(i+1, j)] + A_S*p[IDX(i-1, j)])) / A_P;
+            }
+            __syncthreads();
+
+            // BLACK pass (color = 1)
+            if ((i + j) % 2 == 1) {
+                p[P] = (S[P] - (A_E*p[IDX(i, j+1)] + A_W*p[IDX(i, j-1)] + 
+                                A_N*p[IDX(i+1, j)] + A_S*p[IDX(i-1, j)])) / A_P;
+            }
+            __syncthreads();
         }
     }
 }
 
-// KERNEL 4: Corrector Step (Fix Velocities)
-__global__ void correctorKernel(double* u, double* v, double* u_star, double* v_star, 
-                                double* p, int N, double h, double dt, double rho) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
+// CORRECTOR KERNEL
+__global__ void correctorKernel(double* u, double* v, double* u_star, double* v_star, double* p, int N, int N_ext, double h, double dt, double rho) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
 
-    if (i > 0 && i < N - 1 && j > 0 && j < N - 1) {
-        int P = i * N + j;
-        double dp_dx = (p[i*N + (j+1)] - p[i*N + (j-1)]) / (2.0 * h);
-        double dp_dy = (p[(i+1)*N + j] - p[(i-1)*N + j]) / (2.0 * h);
+    if (i <= N && j <= N) {
+        int P = IDX(i, j);
         
-        u[P] = u_star[P] - (dt / rho) * dp_dx;
-        v[P] = v_star[P] - (dt / rho) * dp_dy;
+        u[P] = u_star[P] - (dt / rho) * ((p[IDX(i, j+1)] - p[IDX(i, j-1)]) / (2.0 * h));
+        v[P] = v_star[P] - (dt / rho) * ((p[IDX(i+1, j)] - p[IDX(i-1, j)]) / (2.0 * h));
     }
+}
+
+// FILE I/O
+void writeOutputCSV(const char* filename, double* u, double* v, double* p, int N, int N_ext, double h) {
+    std::ofstream file(filename);
+    file << "x,y,u,v,p\n";
+    for (int i = 1; i <= N; i++) {
+        for (int j = 1; j <= N; j++) {
+            double x = (j - 0.5) * h;
+            double y = (i - 0.5) * h;
+            file << x << "," << y << "," << u[IDX(i, j)] << "," << v[IDX(i, j)] << "," << p[IDX(i, j)] << "\n";
+        }
+    }
+    file.close();
 }
 
 int main() {
-    int N = 128;                   
-    double h = 1.0 / (N - 1);      
-    double dt = 0.001;             
-    double nu = 0.01;              
-    double rho = 1.0;              
-    int time_steps = 2000;         
-    int poisson_iters = 50;        
-    size_t bytes = N * N * sizeof(double);
+    clock_t total_start = clock();
 
-    // Host Memory (RAM)
-    double *h_u = new double[N * N];
-    
-    // Device Memory (VRAM)
-    double *d_u, *d_v, *d_u_star, *d_v_star, *d_p, *d_S;
-    cudaMalloc(&d_u, bytes);       cudaMemset(d_u, 0, bytes);
-    cudaMalloc(&d_v, bytes);       cudaMemset(d_v, 0, bytes);
-    cudaMalloc(&d_u_star, bytes);  cudaMemset(d_u_star, 0, bytes);
-    cudaMalloc(&d_v_star, bytes);  cudaMemset(d_v_star, 0, bytes);
-    cudaMalloc(&d_p, bytes);       cudaMemset(d_p, 0, bytes);
-    cudaMalloc(&d_S, bytes);       cudaMemset(d_S, 0, bytes);
-
-    dim3 blocks1D((N + 255) / 256);
-    dim3 threads1D(256);
-    dim3 blocks2D((N + 15) / 16, (N + 15) / 16);
-    dim3 threads2D(16, 16);
-
-    std::cout << "GPU: Starting 2D Lid-Driven Cavity Simulation...\n";
-    clock_t start_time = clock();
-
-    for (int step = 0; step < time_steps; step++) {
-        
-        applyBoundaryKernel<<<blocks1D, threads1D>>>(d_u, N);
-        
-        predictorKernel<<<blocks2D, threads2D>>>(d_u, d_v, d_u_star, d_v_star, N, h, dt, nu);
-        
-        divergenceKernel<<<blocks2D, threads2D>>>(d_u_star, d_v_star, d_S, N, h, dt, rho);
-        
-        for (int iter = 0; iter < poisson_iters; iter++) {
-            poissonRbgsKernel<<<blocks2D, threads2D>>>(d_p, d_S, N, h, 0); // RED
-            poissonRbgsKernel<<<blocks2D, threads2D>>>(d_p, d_S, N, h, 1); // BLACK
-        }
-
-        correctorKernel<<<blocks2D, threads2D>>>(d_u, d_v, d_u_star, d_v_star, d_p, N, h, dt, rho);
-        
-        if (step % 500 == 0) std::cout << "GPU completed time step " << step << "...\n";
+    int deviceCount = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&deviceCount));
+    std::cout << "CUDA devices found: " << deviceCount << "\n";
+    if (deviceCount == 0) {
+        std::cerr << "No CUDA device available - aborting.\n";
+        return 1;
     }
-    
-    cudaDeviceSynchronize();
-    clock_t end_time = clock();
-    double time_spent = (double)(end_time - start_time) / CLOCKS_PER_SEC;
 
-    // Retrieve final X-Velocity data for visualization
-    cudaMemcpy(h_u, d_u, bytes, cudaMemcpyDeviceToHost);
+    int N = 128;
+    int N_ext = N + 2;
+    double h = 1.0 / N;
+    double dt = 0.001;
+    double nu = 0.01;
+    double rho = 1.0;
+    size_t total_cells = N_ext * N_ext;
+    size_t bytes = total_cells * sizeof(double);
 
-    std::cout << "Writing velocity data to gpu_cavity_u.txt...\n";
-    std::ofstream outfile("gpu_cavity_u.txt");
-    for (int i = 0; i < N * N; i++) outfile << h_u[i] << "\n";
-    outfile.close();
+    // Host Memory
+    double *h_u = new double[total_cells]();
+    double *h_v = new double[total_cells]();
+    double *h_p = new double[total_cells]();
 
-    std::cout << "Simulation Complete!\n";
-    std::cout << "Grid: " << N << "x" << N << " | Time Steps: " << time_steps << "\n";
-    std::cout << "Total Math Time: " << time_spent << " seconds\n";
+    // Device Memory
+    double *d_u, *d_v, *d_u_star, *d_v_star, *d_p, *d_S;
+    CUDA_CHECK(cudaMalloc((void**)&d_u, bytes));      CUDA_CHECK(cudaMemset(d_u, 0, bytes));
+    CUDA_CHECK(cudaMalloc((void**)&d_v, bytes));      CUDA_CHECK(cudaMemset(d_v, 0, bytes));
+    CUDA_CHECK(cudaMalloc((void**)&d_u_star, bytes)); CUDA_CHECK(cudaMemset(d_u_star, 0, bytes));
+    CUDA_CHECK(cudaMalloc((void**)&d_v_star, bytes)); CUDA_CHECK(cudaMemset(d_v_star, 0, bytes));
+    CUDA_CHECK(cudaMalloc((void**)&d_p, bytes));      CUDA_CHECK(cudaMemset(d_p, 0, bytes));
+    CUDA_CHECK(cudaMalloc((void**)&d_S, bytes));      CUDA_CHECK(cudaMemset(d_S, 0, bytes));
 
-    delete[] h_u; 
-    cudaFree(d_u); cudaFree(d_v); cudaFree(d_u_star); 
-    cudaFree(d_v_star); cudaFree(d_p); cudaFree(d_S);
+    // Grid sized so N threads (indices 1..N) are always covered
+    dim3 threads1D(256);
+    dim3 blocks1D((N + threads1D.x - 1) / threads1D.x);
+    dim3 threads2D(16, 16);
+    dim3 blocks2D((N + threads2D.x - 1) / threads2D.x, (N + threads2D.y - 1) / threads2D.y);
 
+    cudaEvent_t compute_start, compute_end;
+    CUDA_CHECK(cudaEventCreate(&compute_start));
+    CUDA_CHECK(cudaEventCreate(&compute_end));
+
+    std::cout << "Starting 2D Lid-Driven Cavity Simulation (GPU - OPTIMIZED with Kernel Fusion)...\n";
+
+    CUDA_CHECK(cudaEventRecord(compute_start));
+
+    for (int step = 0; step < 10000; step++) {
+        updateVelocityGhostsKernel<<<blocks1D, threads1D>>>(d_u, d_v, N, N_ext);
+
+        predictorKernel<<<blocks2D, threads2D>>>(d_u, d_v, d_u_star, d_v_star, N, N_ext, h, dt, nu);
+
+        divergenceKernel<<<blocks2D, threads2D>>>(d_u_star, d_v_star, d_S, N, N_ext, h, dt, rho);
+
+        poissonRbgsKernelFused<<<blocks2D, threads2D>>>(d_p, d_S, N, N_ext, h, 50);
+
+        pinPressureKernel<<<1, 1>>>(d_p, N_ext);
+
+        correctorKernel<<<blocks2D, threads2D>>>(d_u, d_v, d_u_star, d_v_star, d_p, N, N_ext, h, dt, rho);
+
+        // Catch a launch/execution failure as soon as it happens
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    CUDA_CHECK(cudaEventRecord(compute_end));
+    CUDA_CHECK(cudaEventSynchronize(compute_end));
+
+    float math_time_ms = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&math_time_ms, compute_start, compute_end));
+
+    std::cout << "Data GPU to CPU...\n";
+    CUDA_CHECK(cudaMemcpy(h_u, d_u, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_v, d_v, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_p, d_p, bytes, cudaMemcpyDeviceToHost));
+
+    std::cout << "Writing validation data to gpu_output.csv...\n";
+    writeOutputCSV("gpu_output.csv", h_u, h_v, h_p, N, N_ext, h);
+
+    clock_t total_end = clock();
+
+    double math_time_sec = math_time_ms / 1000.0;
+    double total_time_sec = (double)(total_end - total_start) / CLOCKS_PER_SEC;
+
+    std::cout << "Processing Time (No I/O): " << math_time_sec << " s\n";
+    std::cout << "Total Time (With I/O):    " << total_time_sec << " s\n";
+
+    CUDA_CHECK(cudaFree(d_u)); CUDA_CHECK(cudaFree(d_v)); CUDA_CHECK(cudaFree(d_u_star));
+    CUDA_CHECK(cudaFree(d_v_star)); CUDA_CHECK(cudaFree(d_p)); CUDA_CHECK(cudaFree(d_S));
+    delete[] h_u; delete[] h_v; delete[] h_p;
     return 0;
-}       
+}
