@@ -4,12 +4,12 @@
 #include <cuda_runtime.h>
 
 /*
-SETUP: 2D Lid-Driven Cavity (GPU)
+SETUP: 2D Lid-Driven Cavity (GPU) - FIXED with separate ghost updates
 */
 
 #define IDX(i, j) ((i) * N_ext + (j))
 
-// Error check macro - wrap every CUDA call with this
+// Error check macro
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
     if (err != cudaSuccess) { \
@@ -41,14 +41,24 @@ __global__ void updateVelocityGhostsKernel(double* u, double* v, int N, int N_ex
     }
 }
 
+__global__ void updatePressureGhostsKernel(double* p, int N, int N_ext) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    if (k <= N) {
+        p[IDX(N + 1, k)] = p[IDX(N, k)]; // Top (Row N+1)
+        p[IDX(0, k)]     = p[IDX(1, k)]; // Bottom (Row 0)
+        p[IDX(k, 0)]     = p[IDX(k, 1)]; // Left (Col 0)
+        p[IDX(k, N + 1)] = p[IDX(k, N)]; // Right (Col N+1)
+    }
+}
+
 __global__ void pinPressureKernel(double* p, int N_ext) {
     p[IDX(1, 1)] = 0.0;
 }
 
 // PREDICTOR KERNEL
 __global__ void predictorKernel(double* u, double* v, double* u_star, double* v_star, int N, int N_ext, double h, double dt, double nu) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x + 1; // X-axis (Columns)
-    int i = blockIdx.y * blockDim.y + threadIdx.y + 1; // Y-axis (Rows)
+    int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
 
     if (i <= N && j <= N) {
         int P = IDX(i, j);
@@ -80,46 +90,20 @@ __global__ void divergenceKernel(double* u_star, double* v_star, double* S, int 
     }
 }
 
-// POISSON SOLVER KERNEL
-__global__ void poissonRbgsKernelFused(double* p, double* S, int N, int N_ext, double h, int num_iterations) {
+// POISSON SOLVER KERNEL (red-black Gauss-Seidel) - single color per call
+__global__ void poissonRbgsKernel(double* p, double* S, int N, int N_ext, double h, int color) {
     int j = blockIdx.x * blockDim.x + threadIdx.x + 1;
     int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
 
     if (i <= N && j <= N) {
-        int P = IDX(i, j);
-        double A_E = 1.0 / (h * h); double A_W = 1.0 / (h * h);
-        double A_N = 1.0 / (h * h); double A_S = 1.0 / (h * h);
-        double A_P = -4.0 / (h * h);
+        if ((i + j) % 2 == color) {
+            int P = IDX(i, j);
+            double A_E = 1.0 / (h * h); double A_W = 1.0 / (h * h);
+            double A_N = 1.0 / (h * h); double A_S = 1.0 / (h * h);
+            double A_P = -4.0 / (h * h);
 
-        for (int iter = 0; iter < num_iterations; iter++) {
-            // Update pressure ghosts 
-            if (i == 1) {
-                p[IDX(0, j)] = p[IDX(1, j)];      // Bottom
-            }
-            if (i == N) {
-                p[IDX(N + 1, j)] = p[IDX(N, j)];  // Top
-            }
-            if (j == 1) {
-                p[IDX(i, 0)] = p[IDX(i, 1)];      // Left
-            }
-            if (j == N) {
-                p[IDX(i, N + 1)] = p[IDX(i, N)];  // Right
-            }
-            __syncthreads();
-
-            // RED pass (color = 0)
-            if ((i + j) % 2 == 0) {
-                p[P] = (S[P] - (A_E*p[IDX(i, j+1)] + A_W*p[IDX(i, j-1)] + 
-                                A_N*p[IDX(i+1, j)] + A_S*p[IDX(i-1, j)])) / A_P;
-            }
-            __syncthreads();
-
-            // BLACK pass (color = 1)
-            if ((i + j) % 2 == 1) {
-                p[P] = (S[P] - (A_E*p[IDX(i, j+1)] + A_W*p[IDX(i, j-1)] + 
-                                A_N*p[IDX(i+1, j)] + A_S*p[IDX(i-1, j)])) / A_P;
-            }
-            __syncthreads();
+            p[P] = (S[P] - (A_E*p[IDX(i, j+1)] + A_W*p[IDX(i, j-1)] +
+                            A_N*p[IDX(i+1, j)] + A_S*p[IDX(i-1, j)])) / A_P;
         }
     }
 }
@@ -131,7 +115,6 @@ __global__ void correctorKernel(double* u, double* v, double* u_star, double* v_
 
     if (i <= N && j <= N) {
         int P = IDX(i, j);
-        
         u[P] = u_star[P] - (dt / rho) * ((p[IDX(i, j+1)] - p[IDX(i, j-1)]) / (2.0 * h));
         v[P] = v_star[P] - (dt / rho) * ((p[IDX(i+1, j)] - p[IDX(i-1, j)]) / (2.0 * h));
     }
@@ -185,7 +168,6 @@ int main() {
     CUDA_CHECK(cudaMalloc((void**)&d_p, bytes));      CUDA_CHECK(cudaMemset(d_p, 0, bytes));
     CUDA_CHECK(cudaMalloc((void**)&d_S, bytes));      CUDA_CHECK(cudaMemset(d_S, 0, bytes));
 
-    // Grid sized so N threads (indices 1..N) are always covered
     dim3 threads1D(256);
     dim3 blocks1D((N + threads1D.x - 1) / threads1D.x);
     dim3 threads2D(16, 16);
@@ -195,7 +177,7 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&compute_start));
     CUDA_CHECK(cudaEventCreate(&compute_end));
 
-    std::cout << "Starting 2D Lid-Driven Cavity Simulation (GPU - OPTIMIZED with Kernel Fusion)...\n";
+    std::cout << "Starting 2D Lid-Driven Cavity Simulation...\n";
 
     CUDA_CHECK(cudaEventRecord(compute_start));
 
@@ -206,13 +188,17 @@ int main() {
 
         divergenceKernel<<<blocks2D, threads2D>>>(d_u_star, d_v_star, d_S, N, N_ext, h, dt, rho);
 
-        poissonRbgsKernelFused<<<blocks2D, threads2D>>>(d_p, d_S, N, N_ext, h, 50);
+        // ORIGINAL METHOD: Separate kernel launches (but still works correctly)
+        for (int iter = 0; iter < 50; iter++) {
+            updatePressureGhostsKernel<<<blocks1D, threads1D>>>(d_p, N, N_ext);
+            poissonRbgsKernel<<<blocks2D, threads2D>>>(d_p, d_S, N, N_ext, h, 0); // RED
+            poissonRbgsKernel<<<blocks2D, threads2D>>>(d_p, d_S, N, N_ext, h, 1); // BLACK
+        }
 
         pinPressureKernel<<<1, 1>>>(d_p, N_ext);
 
         correctorKernel<<<blocks2D, threads2D>>>(d_u, d_v, d_u_star, d_v_star, d_p, N, N_ext, h, dt, rho);
 
-        // Catch a launch/execution failure as soon as it happens
         CUDA_CHECK(cudaGetLastError());
     }
 
